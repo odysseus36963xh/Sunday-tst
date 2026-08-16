@@ -753,7 +753,8 @@ function stopReading() {
   
   const popup = document.getElementById("mediaPopup");
   if (popup) popup.innerHTML = "";
-  
+  window._pendingRowAudios = [];
+
   clearHighlight();
 }
 
@@ -937,8 +938,12 @@ function playCellMedia(cell, overlapMs) {
 
       if (overlapMs && isLastAudioInCell) {
         // Early-resolve: don't block the reader waiting for this
-        // audio to finish. It keeps playing in the background.
-        await playAndWaitForAudio(audio, overlapMs);
+        // audio to finish. It keeps playing in the background — but
+        // track its TRUE completion so the reading engine can still
+        // wait for it before repeating/advancing past this row.
+        const p = playAndWaitForAudio(audio, overlapMs);
+        window._pendingRowAudios.push(p.trueCompletion);
+        await p;
       } else {
         // Original behavior: wait for full completion.
         await playAndWaitForAudio(audio);
@@ -954,6 +959,14 @@ function playCellMedia(cell, overlapMs) {
 }
 
 
+// True-completion tracking for row-boundary waits: when overlap lets a
+// row move on while a cell's audio keeps playing in the background, we
+// still need to know when that audio ACTUALLY finishes so the reading
+// engine can pause before repeating/advancing past that row. Each entry
+// is a Promise that resolves once the corresponding audio truly ends
+// (onended/onerror/onabort/timeout) — never on the early overlap resolve.
+window._pendingRowAudios = window._pendingRowAudios || [];
+
 // overlapMs (optional): if provided, this promise resolves after
 // overlapMs milliseconds even if the audio is still playing, so the
 // caller (the reading engine) can move on to the next cell while
@@ -963,7 +976,10 @@ function playCellMedia(cell, overlapMs) {
 // gets removed from window.currentMediaElements) whenever it
 // actually finishes.
 function playAndWaitForAudio(audio, overlapMs) {
-  return new Promise((resolve) => {
+  let markTrueDone;
+  const trueCompletion = new Promise(res => { markTrueDone = res; });
+
+  const outer = new Promise((resolve) => {
     let finished = false;      // guards the OUTER promise (this call)
     let overlapTimer = null;
 
@@ -994,6 +1010,7 @@ function playAndWaitForAudio(audio, overlapMs) {
       // (even if the reading loop already moved on via overlap).
       if (audio._bubbleGroup) removeBubbleGroup(audio._bubbleGroup);
       resolveOnce();
+      markTrueDone(); // audio has ACTUALLY finished now
     }
 
     audio.onended = function() {
@@ -1043,6 +1060,9 @@ function playAndWaitForAudio(audio, overlapMs) {
       // and the reader will still wait for audio.onended.
     });
   });
+
+  outer.trueCompletion = trueCompletion;
+  return outer;
 }
 
 function isImageType(type) {
@@ -1080,6 +1100,7 @@ async function startReading() {
   // one cell's audio playing at once, so this is an accumulating list,
   // not a single "current" element).
   window.currentMediaElements = [];
+  window._pendingRowAudios = [];
 
   const table = document.getElementById("sheet");
   if (!table) {
@@ -1202,6 +1223,17 @@ async function startReading() {
               cell.classList.remove("reading");
             }
           }
+
+          // Row pass finished. If overlap let the last audio-bearing
+          // cell in this row keep playing in the background, wait for
+          // it to ACTUALLY finish before repeating this row again or
+          // moving on to the next row — so a row is never cut off or
+          // repeated over top of its own still-playing audio.
+          if (window._pendingRowAudios.length) {
+            const pending = window._pendingRowAudios;
+            window._pendingRowAudios = [];
+            await Promise.all(pending);
+          }
         }
       }
     }
@@ -1211,6 +1243,7 @@ async function startReading() {
 
     const popup = document.getElementById("mediaPopup");
     if (popup) popup.innerHTML = "";
+    window._pendingRowAudios = [];
   }
 }
 
